@@ -47,6 +47,8 @@ canonical_sources:
     doc_id: "it_helpdesk_faq"
   - path: "data/docs/hr_leave_policy.txt"
     doc_id: "hr_leave_policy"
+  - path: "data/docs/access_control_sop.txt"
+    doc_id: "access_control_sop"
 
 # Baseline allowlist export — nhóm mở rộng doc mới phải đồng bộ cleaning_rules + contract.
 allowed_doc_ids:
@@ -54,7 +56,12 @@ allowed_doc_ids:
   - sla_p1_2026
   - it_helpdesk_faq
   - hr_leave_policy
+  - access_control_sop
 
 # Merit/Distinction: có thể đưa cutoff versioning vào env và tham chiếu ở đây (tránh hard-code trong code).
 policy_versioning:
+  policy_refund_min_effective_date: "2026-02-01"
+  sla_p1_min_effective_date: "2026-01-15"
+  it_helpdesk_min_effective_date: "2026-01-20"
   hr_leave_min_effective_date: "2026-01-01"
+  access_control_min_effective_date: "2026-01-01"

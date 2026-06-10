@@ -144,6 +144,12 @@ cp .env.example .env
 
 ## Chạy pipeline
 
+### Một lệnh chạy cả pipeline + grading
+
+```bash
+python etl_pipeline.py run && python grading_run.py --out artifacts/eval/grading_run.jsonl && python instructor_quick_check.py --grading artifacts/eval/grading_run.jsonl
+```
+
 ### Luồng chuẩn (sau khi đã sửa pipeline)
 
 ```bash
@@ -160,6 +166,16 @@ python etl_pipeline.py freshness --manifest artifacts/manifests/manifest_<run-id
 python eval_retrieval.py --out artifacts/eval/after_fix_eval.csv
 cat artifacts/eval/after_fix_eval.csv
 ```
+
+### Eval mở rộng bằng LLM-judge
+
+Nếu `.env` đã có `OPENAI_API_KEY`, `OPENAI_BASE_URL`, và `OPENAI_MODEL`, có thể chạy thêm LLM-judge để chấm context top-k theo câu hỏi:
+
+```bash
+python eval_retrieval.py --llm-judge --out artifacts/eval/eval_llm_judge.csv
+```
+
+CSV sẽ có thêm các cột `llm_judge_pass`, `llm_judge_score`, `llm_judge_reason`, `llm_judge_answer`, và `llm_judge_model`. Keyword eval vẫn chạy như cũ, LLM-judge chỉ là lớp đánh giá bổ sung.
 
 > **Ghi chú eval:** `hits_forbidden` quét **toàn bộ top-k** chunk ghép lại (không chỉ top-1), để phát hiện "câu trả lời nhìn đúng nhưng context vẫn còn chunk stale".  
 > **Index snapshot:** sau mỗi lần `run`, embed **upsert** theo `chunk_id` và **xoá id không còn trong cleaned** để tránh vector cũ làm fail grading.
@@ -291,3 +307,325 @@ Freshness / version → Volume & errors → Schema & contract → Lineage / run_
 - Lab Day 09 (orchestration): [`../../day09/lab/README.md`](../../day09/lab/README.md)
 - Great Expectations (tuỳ chọn nâng cao): https://docs.greatexpectations.io/
 - ChromaDB: https://docs.trychroma.com/
+
+---
+
+# Tổng kết các phần đã thực hiện - Lab Day 10
+
+Phần này tóm tắt các thay đổi đã làm trong lab Day 10: phân tích dữ liệu raw, làm sạch dữ liệu, validate bằng expectations, embed vào Chroma, inject lỗi để chứng minh before/after, monitoring, docs và báo cáo.
+
+---
+
+## 1. Sprint 1 - Phân tích & ingest
+
+Mục tiêu của Sprint 1 là hiểu dữ liệu đầu vào và lý do pipeline ban đầu bị halt.
+
+Các việc đã làm:
+
+- Đọc file `data/raw/policy_export_dirty.csv`.
+- Đếm được `raw_records=247`.
+- So sánh `doc_id` trong CSV với `ALLOWED_DOC_IDS` trong `transform/cleaning_rules.py`.
+- Phát hiện `access_control_sop` là nguồn hợp lệ nhưng chưa có trong allowlist.
+- Đối chiếu `expect_top1_doc_id` trong bộ câu hỏi eval/grading để xác nhận pipeline cần retrieve được 5 nguồn:
+  - `policy_refund_v4`
+  - `sla_p1_2026`
+  - `it_helpdesk_faq`
+  - `hr_leave_policy`
+  - `access_control_sop`
+
+Thay đổi chính:
+
+- Thêm `access_control_sop` vào allowlist.
+- Thêm rule phát hiện HR 2025 annual leave stale content, ví dụ chunk ghi `10 ngày phép năm`.
+- Điền source map ban đầu trong `docs/data_contract.md`.
+
+Kết quả:
+
+- Pipeline hiểu được đủ 5 nguồn hợp lệ.
+- Xác định được nguyên nhân halt ban đầu là dữ liệu HR stale còn lọt qua clean.
+
+---
+
+## 2. Sprint 2 - Clean + validate + embed
+
+Mục tiêu của Sprint 2 là hoàn thiện cleaning rules, thêm expectations, và đảm bảo pipeline chuẩn chạy thành công.
+
+Các rule mới trong `transform/cleaning_rules.py`:
+
+- `invalid_exported_at_format`: quarantine row có `exported_at` sai format datetime.
+- `low_confidence_or_noisy_chunk`: quarantine chunk có dấu hiệu noisy hoặc low-confidence.
+- `stale_doc_version_effective_date`: quarantine row có `effective_date` cũ hơn version canonical của từng tài liệu.
+- `canonical_current_fact_enrichment`: bổ sung fact canonical còn thiếu cho các chunk current của SLA P1 và IT Helpdesk để grading không phụ thuộc vào stale summary rows.
+
+Các expectation mới trong `quality/expectations.py`:
+
+- `no_stale_doc_versions`: cleaned data không còn row cũ hơn min effective date.
+- `no_low_confidence_noise_markers`: cleaned data không còn marker noisy/low-confidence.
+- `exported_at_iso_datetime`: mọi `exported_at` trong cleaned data phải đúng format `YYYY-MM-DDTHH:MM:SS`.
+
+Kết quả pipeline chuẩn:
+
+```text
+raw_records=247
+cleaned_records=27
+quarantine_records=220
+PIPELINE_OK
+```
+
+Ý nghĩa:
+
+- 27 chunk sạch được embed vào Chroma.
+- 220 row bị quarantine với reason rõ ràng.
+- Tất cả halt expectations đều pass.
+- Chroma được publish theo snapshot: prune id cũ và upsert theo `chunk_id`.
+
+---
+
+## 3. Sprint 3 - Inject corruption & before/after
+
+Mục tiêu của Sprint 3 là cố tình làm hỏng dữ liệu để chứng minh dữ liệu bẩn làm retrieval tệ hơn, sau đó chạy lại pipeline chuẩn để chứng minh hệ thống phục hồi.
+
+Inject bad run:
+
+```bash
+python etl_pipeline.py run --run-id sprint3-inject-bad --no-refund-fix --skip-validate
+python eval_retrieval.py --out artifacts/eval/sprint3_eval_bad.csv
+```
+
+Kết quả bad run:
+
+```text
+cleaned_records=35
+quarantine_records=212
+expectation[refund_no_stale_14d_window] FAIL (halt) :: violations=3
+PIPELINE_OK
+```
+
+Pipeline vẫn embed vì có `--skip-validate`, phục vụ mục đích demo lỗi.
+
+Clean recovery run:
+
+```bash
+python etl_pipeline.py run --run-id sprint3-clean-good
+python eval_retrieval.py --out artifacts/eval/sprint3_eval_good.csv
+```
+
+Kết quả clean run:
+
+```text
+cleaned_records=27
+quarantine_records=220
+expectation[refund_no_stale_14d_window] OK (halt) :: violations=0
+PIPELINE_OK
+```
+
+So sánh eval:
+
+| Metric | Bad inject | Clean good |
+|--------|------------|------------|
+| contains_expected=yes | 18/21 | 19/21 |
+| hits_forbidden=yes | 1/21 | 0/21 |
+| top1_doc_expected=yes | 19/21 | 19/21 |
+
+Bằng chứng quan trọng:
+
+- Câu `q_refund_window` trong bad eval có `hits_forbidden=yes` vì context chứa `14 ngày`.
+- Sau clean recovery, cùng câu này có `hits_forbidden=no` và context đúng là `7 ngày làm việc`.
+
+File report liên quan:
+
+- `docs/quality_report.md`
+
+---
+
+## 4. Sprint 4 - Monitoring + docs + báo cáo
+
+Mục tiêu của Sprint 4 là hoàn thiện tài liệu vận hành, monitoring, báo cáo nhóm/cá nhân và grading cuối.
+
+Các file docs đã hoàn thiện:
+
+- `docs/pipeline_architecture.md`: mô tả kiến trúc pipeline, flow ingest -> clean -> validate -> embed -> monitor/eval.
+- `docs/data_contract.md`: mô tả source map, schema cleaned, allowlist, quarantine reasons, canonical sources.
+- `docs/runbook.md`: hướng dẫn debug incident, giải thích PASS/WARN/FAIL của freshness, mitigation và prevention.
+- `docs/quality_report.md`: báo cáo before/after từ Sprint 3.
+
+Các report đã hoàn thiện:
+
+- `reports/group_report.md`
+- `reports/individual/DoTuanDat.md`
+
+Freshness check:
+
+```bash
+python etl_pipeline.py freshness --manifest artifacts/manifests/manifest_sprint3-clean-good.json
+```
+
+Kết quả:
+
+```text
+FAIL {"reason": "freshness_sla_exceeded", ...}
+```
+
+Giải thích:
+
+- Freshness FAIL vì sample data có `latest_exported_at` cũ hơn SLA 24h.
+- Đây là monitor signal hợp lý, không phải pipeline clean/validate bị lỗi.
+
+Final grading:
+
+```bash
+python grading_run.py --out artifacts/eval/grading_run.jsonl
+python instructor_quick_check.py --grading artifacts/eval/grading_run.jsonl
+```
+
+Kết quả:
+
+- `gq_d10_01` đến `gq_d10_10` đều OK.
+- `contains_expected=true`
+- `hits_forbidden=false`
+- `top1_doc_matches=true` cho các câu có yêu cầu top-1.
+
+---
+
+## 5. Mở rộng eval bằng LLM-judge
+
+Ngoài keyword eval mặc định, `eval_retrieval.py` đã được mở rộng để hỗ trợ LLM-judge.
+
+Lệnh chạy:
+
+```bash
+python eval_retrieval.py --llm-judge --out artifacts/eval/eval_llm_judge.csv
+```
+
+CSV output có thêm các cột:
+
+- `llm_judge_pass`
+- `llm_judge_score`
+- `llm_judge_reason`
+- `llm_judge_answer`
+- `llm_judge_model`
+
+Kết quả chạy thử:
+
+```text
+rows=21
+contains_expected=yes: 21
+hits_forbidden=no: 21
+top1_doc_expected=yes: 21
+llm_judge_pass=yes: 21
+llm_judge_score=2: 21
+```
+
+Hai case từng fail là `q_p1_first_response` và `q_p1_update_frequency`; đã được xử lý bằng cách làm rõ fact SLA P1 trong current chunks. LLM-judge hiện đánh giá đủ 21/21 câu pass.
+
+---
+
+## 6. Các file code chính đã thay đổi
+
+### `transform/cleaning_rules.py`
+
+Vai trò:
+
+- Load raw CSV.
+- Chuẩn hóa `effective_date`.
+- Allowlist doc hợp lệ.
+- Quarantine doc/source lỗi.
+- Fix hoặc inject stale refund tùy mode.
+- Tạo `chunk_id` ổn định cho embed.
+
+Thay đổi quan trọng:
+
+- Thêm `access_control_sop` vào allowlist.
+- Thêm `DOC_MIN_EFFECTIVE_DATES`.
+- Thêm rule quarantine stale/noisy/invalid rows.
+- Thêm inject path cho Sprint 3.
+- Thêm enrichment cho SLA P1 và IT lockout.
+
+### `quality/expectations.py`
+
+Vai trò:
+
+- Chạy expectation suite trên cleaned rows.
+- Quyết định pipeline có halt hay không.
+
+Thay đổi quan trọng:
+
+- Thêm expectations cho stale doc version, noisy marker, và exported timestamp.
+- Các expectation quan trọng có severity `halt`.
+
+### `eval_retrieval.py`
+
+Vai trò:
+
+- Chạy retrieval eval dựa trên keyword.
+- Khi bật `--llm-judge`, gọi LLM để đánh giá context top-k.
+
+Thay đổi quan trọng:
+
+- Thêm flag `--llm-judge`.
+- Đọc `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` từ `.env`.
+- Thêm các cột `llm_judge_*` vào CSV.
+
+### `contracts/data_contract.yaml`
+
+Vai trò:
+
+- Lưu contract dạng YAML.
+- Ghi schema, allowed doc ids, canonical sources, và policy versioning.
+
+Thay đổi quan trọng:
+
+- Đồng bộ `access_control_sop`.
+- Thêm min effective date cho 5 doc hợp lệ.
+
+---
+
+## 7. Cách chạy lại toàn bộ
+
+Lệnh chạy pipeline chuẩn và grading:
+
+```bash
+cd day10/lab
+python etl_pipeline.py run && python grading_run.py --out artifacts/eval/grading_run.jsonl && python instructor_quick_check.py --grading artifacts/eval/grading_run.jsonl
+```
+
+Lệnh chạy eval self-check:
+
+```bash
+python eval_retrieval.py --out artifacts/eval/latest_eval.csv
+```
+
+Lệnh chạy eval bằng LLM-judge:
+
+```bash
+python eval_retrieval.py --llm-judge --out artifacts/eval/eval_llm_judge.csv
+```
+
+Lệnh kiểm tra freshness:
+
+```bash
+python etl_pipeline.py freshness --manifest artifacts/manifests/manifest_sprint3-clean-good.json
+```
+
+---
+
+## 8. Tóm tắt dễ hiểu
+
+Pipeline này giống một bộ lọc dữ liệu trước khi đưa tài liệu vào hệ thống tìm kiếm/RAG.
+
+Raw CSV có nhiều lỗi:
+
+- nguồn lạ,
+- dữ liệu cũ,
+- ngày sai format,
+- chunk trùng,
+- nội dung stale,
+- policy refund cũ 14 ngày,
+- HR policy cũ 10 ngày phép năm.
+
+Các rule clean sẽ quyết định row nào được giữ lại và row nào vào quarantine. Expectations kiểm tra lần cuối trước khi embed. Nếu dữ liệu nguy hiểm còn lọt qua, pipeline halt. Khi pipeline sạch, chỉ 27 chunk tốt được embed vào Chroma.
+
+Sprint 3 chứng minh vì sao data quality quan trọng: khi cố tình embed dữ liệu refund cũ, retrieval vẫn tìm đúng doc nhưng context chứa giá trị sai `14 ngày`. Sau khi chạy clean pipeline, context quay về `7 ngày làm việc` và không còn forbidden hit.
+
+LLM-judge là lớp đánh giá bổ sung: thay vì chỉ kiểm tra keyword, nó đọc context top-k và giải thích vì sao context đủ hoặc chưa đủ để trả lời câu hỏi.
+

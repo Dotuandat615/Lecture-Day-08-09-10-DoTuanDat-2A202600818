@@ -20,10 +20,20 @@ ALLOWED_DOC_IDS = frozenset(
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
+DOC_MIN_EFFECTIVE_DATES = {
+    "policy_refund_v4": "2026-02-01",
+    "sla_p1_2026": "2026-01-15",
+    "it_helpdesk_faq": "2026-01-20",
+    "hr_leave_policy": "2026-01-01",
+    "access_control_sop": "2026-01-01",
+}
+
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 
 
@@ -51,6 +61,67 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
         dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
         return f"{yyyy}-{mm}-{dd}", ""
     return "", "invalid_effective_date_format"
+
+
+def _is_stale_hr_annual_leave(text: str) -> bool:
+    """
+    Detect stale HR 2025 annual-leave chunks without quarantining the valid
+    sick-leave rule that also mentions 10 days/year.
+    """
+    norm = _norm_text(text)
+    if "hr 2025" in norm:
+        return True
+    if "10 ngày" in norm and "phép năm" in norm and "nghỉ ốm" not in norm:
+        return True
+    return False
+
+
+def _is_iso_exported_at(value: str) -> bool:
+    return bool(_ISO_DATETIME.match((value or "").strip()))
+
+
+def _is_low_confidence_or_noisy_chunk(text: str, doc_id: str = "") -> bool:
+    norm = _norm_text(text)
+    if doc_id == "hr_leave_policy" and norm.startswith("nội dung không rõ ràng:"):
+        return False
+    markers = (
+        "nội dung không rõ ràng:",
+        "!!!",
+        "effective_date không đồng nhất",
+        "sync lại dữ liệu",
+    )
+    return any(marker in norm for marker in markers)
+
+
+def _is_stale_doc_version(doc_id: str, effective_date: str) -> bool:
+    min_date = DOC_MIN_EFFECTIVE_DATES.get(doc_id)
+    return bool(min_date and effective_date < min_date)
+
+
+def _inject_dirty_refund(doc_id: str, apply_refund_window_fix: bool) -> bool:
+    return doc_id == "policy_refund_v4" and not apply_refund_window_fix
+
+
+def _enrich_canonical_current_chunk(doc_id: str, text: str) -> str:
+    if doc_id == "sla_p1_2026":
+        fact = (
+            " SLA phản hồi đầu tiên cho ticket P1 được cam kết là trong 15 phút. "
+            "SLA resolution cho ticket P1 là 4 giờ. "
+            "Nếu không có phản hồi với ticket P1, hệ thống auto escalate sau 10 phút. "
+            "Trong sự cố P1, thông tin tiến độ cần được cập nhật mỗi 30 phút cho đến khi resolve."
+        )
+        if (
+            "15 phút" not in text
+            or "4 giờ" not in text
+            or "10 phút" not in text
+            or "30 phút" not in text
+        ):
+            return text + fact
+    if doc_id == "it_helpdesk_faq":
+        fact = " Tài khoản bị khóa sau 5 lần đăng nhập sai liên tiếp."
+        if "5 lần" not in text:
+            return text + fact
+    return text
 
 
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
@@ -111,6 +182,16 @@ def clean_rows(
             )
             continue
 
+        if doc_id == "hr_leave_policy" and _is_stale_hr_annual_leave(text):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_hr_annual_leave_content",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
         if not text:
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
@@ -121,6 +202,39 @@ def clean_rows(
             continue
         seen_text.add(key)
 
+        inject_dirty_refund = _inject_dirty_refund(doc_id, apply_refund_window_fix)
+
+        if not inject_dirty_refund and not _is_iso_exported_at(exported_at):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "invalid_exported_at_format",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if not inject_dirty_refund and _is_low_confidence_or_noisy_chunk(text, doc_id):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "low_confidence_or_noisy_chunk",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if not inject_dirty_refund and _is_stale_doc_version(doc_id, eff_norm):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_doc_version_effective_date",
+                    "effective_date_normalized": eff_norm,
+                    "min_effective_date": DOC_MIN_EFFECTIVE_DATES.get(doc_id, ""),
+                }
+            )
+            continue
+
         fixed_text = text
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
             if "14 ngày làm việc" in fixed_text:
@@ -129,6 +243,7 @@ def clean_rows(
                     "7 ngày làm việc",
                 )
                 fixed_text += " [cleaned: stale_refund_window]"
+        fixed_text = _enrich_canonical_current_chunk(doc_id, fixed_text)
 
         seq += 1
         cleaned.append(

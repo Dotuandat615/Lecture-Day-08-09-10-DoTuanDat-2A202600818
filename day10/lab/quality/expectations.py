@@ -10,6 +10,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+from transform.cleaning_rules import (
+    DOC_MIN_EFFECTIVE_DATES,
+    _is_iso_exported_at,
+    _is_low_confidence_or_noisy_chunk,
+)
+
 
 @dataclass
 class ExpectationResult:
@@ -109,6 +115,55 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    stale_versions = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") in DOC_MIN_EFFECTIVE_DATES
+        and (r.get("effective_date") or "") < DOC_MIN_EFFECTIVE_DATES[r.get("doc_id")]
+    ]
+    ok7 = len(stale_versions) == 0
+    results.append(
+        ExpectationResult(
+            "no_stale_doc_versions",
+            ok7,
+            "halt",
+            f"violations={len(stale_versions)}",
+        )
+    )
+
+    noisy_chunks = [
+        r
+        for r in cleaned_rows
+        if _is_low_confidence_or_noisy_chunk(
+            r.get("chunk_text") or "",
+            r.get("doc_id") or "",
+        )
+    ]
+    ok8 = len(noisy_chunks) == 0
+    results.append(
+        ExpectationResult(
+            "no_low_confidence_noise_markers",
+            ok8,
+            "halt",
+            f"violations={len(noisy_chunks)}",
+        )
+    )
+
+    bad_exported_at = [
+        r
+        for r in cleaned_rows
+        if not _is_iso_exported_at(r.get("exported_at") or "")
+    ]
+    ok9 = len(bad_exported_at) == 0
+    results.append(
+        ExpectationResult(
+            "exported_at_iso_datetime",
+            ok9,
+            "halt",
+            f"non_iso_exported_at_rows={len(bad_exported_at)}",
         )
     )
 
